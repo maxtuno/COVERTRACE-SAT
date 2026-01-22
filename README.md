@@ -23,10 +23,11 @@ Hybrid (default): Start with CoverTrace and switch to CDCL if it becomes costly:
 
 Switch to CDCL if |U| exceeds a certain size:
 
-    ./covertrace_sat --hybrid --switch-u 300000 input.
+    ./covertrace_sat --hybrid --switch-u 300000 input.cnf
 
 Switch to CDCL if CoverTrace takes more than X ms:
 
     ./covertrace_sat --hybrid --switch-ms 5000 input.cnf
   
+
 
