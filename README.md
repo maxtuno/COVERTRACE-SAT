@@ -29,5 +29,8 @@ Switch to CDCL if CoverTrace takes more than X ms:
 
     ./covertrace_sat --hybrid --switch-ms 5000 input.cnf
   
+All-In:
+
+    ./covertrace_sat --hybrid --compress --sort-clauses --switch-u 300000 --switch-ms 5000 input.cnf
 
 
