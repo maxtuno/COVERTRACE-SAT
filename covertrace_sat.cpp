@@ -10,7 +10,7 @@ You should have received a copy of the GNU Affero General Public License along w
 Commercial licensing options are available. See COMMERCIAL.md for details.
 */
 
-// covertrace_sat.cpp
+// covertrace_sat_hybrid_interleaved.cpp
 // Hybrid SAT solver: CDCL (standard heuristics) + interleaved CoverTrace UNSAT detector.
 //
 // Features (CDCL):
@@ -29,7 +29,7 @@ Commercial licensing options are available. See COMMERCIAL.md for details.
 //  - Optional: CoverTrace witness (when y>0) is used to set CDCL phase preferences.
 //
 // Build:
-//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat
+//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat_hybrid_interleaved.cpp -o covertrace_sat
 //
 // Run:
 //   ./covertrace_sat --interleaved --ct-seed-original test.cnf
@@ -805,7 +805,10 @@ struct CDCLSolver {
 
     void cancelUntil(int lvl) {
         if (decisionLevel() <= lvl) return;
-        int lim = (lvl == 0) ? 0 : trail_lim[(size_t)lvl - 1];
+        // trail_lim[i] stores the trail index where decision level (i+1) starts.
+        // To backtrack to level `lvl`, we must keep assignments up to the start of level (lvl+1),
+        // i.e. trail_lim[lvl]. (For lvl==0 we keep nothing beyond level 0.)
+        int lim = (lvl == 0) ? 0 : trail_lim[(size_t)lvl];
         for (int i = (int)trail.size() - 1; i >= lim; --i) {
             int v = var(trail[(size_t)i]);
             assigns[(size_t)v] = 0;
@@ -952,9 +955,17 @@ struct CDCLSolver {
         return -1;
     }
 
-    // add clause from internal lits; returns false if contradiction at level 0
-    bool addClauseInternal(vector<Lit> lits, bool learnt = false, int lbd = 0) {
+    // add clause from internal lits; returns false if contradiction at level 0.
+    // If out_ci is provided, it will be set to the new clause index, or -1 if the clause was ignored
+    // (tautology / already satisfied) or handled as a unit at level 0.
+    bool addClauseInternal(vector<Lit> lits, bool learnt = false, int lbd = 0, int* out_ci = nullptr) {
+        if (out_ci) *out_ci = -1;
         if (lits.empty()) return false;
+
+        // Learned clauses rely on lits[0] being the asserting literal (used for enqueue and as a watched lit).
+        // Keep track of it through simplification/reordering.
+        Lit asserting = -1;
+        if (learnt) asserting = lits[0];
 
         sort(lits.begin(), lits.end());
         lits.erase(unique(lits.begin(), lits.end()), lits.end());
@@ -979,6 +990,21 @@ struct CDCLSolver {
             }
         }
 
+        if (learnt && lits.size() > 1) {
+            // Ensure asserting literal is at position 0 (do this before attachClause uses lits[0]/lits[1]).
+            auto it = find(lits.begin(), lits.end(), asserting);
+            if (it != lits.end()) swap(lits[0], *it);
+
+            // For better propagation, put the highest decision-level literal (excluding the asserting one) at pos 1.
+            size_t best = 1;
+            int best_lv = level[(size_t)var(lits[1])];
+            for (size_t i = 2; i < lits.size(); ++i) {
+                int lv = level[(size_t)var(lits[i])];
+                if (lv > best_lv) { best_lv = lv; best = i; }
+            }
+            swap(lits[1], lits[best]);
+        }
+
         Clause c;
         c.lits = std::move(lits);
         c.learnt = learnt;
@@ -987,6 +1013,7 @@ struct CDCLSolver {
         clauses.push_back(std::move(c));
         attachClause(ci);
         if (learnt) learnt_ids.push_back(ci);
+        if (out_ci) *out_ci = ci;
         return true;
     }
 
@@ -1058,10 +1085,14 @@ struct CDCLSolver {
 
     bool locked(int ci) const {
         const Clause& c = clauses[(size_t)ci];
-        if (c.lits.empty()) return false;
-        Lit p = c.lits[0];
-        int v = var(p);
-        return reason[(size_t)v] == ci;
+        if (c.deleted || c.lits.empty()) return false;
+        // A clause is locked if it is currently the reason for any assigned variable.
+        // Do not assume the implied literal is stored at a fixed position.
+        for (Lit p : c.lits) {
+            int v = var(p);
+            if (reason[(size_t)v] == ci) return true;
+        }
+        return false;
     }
 
     void reduceDB() {
@@ -1086,7 +1117,10 @@ struct CDCLSolver {
 
         size_t to_del = cand.size() / 2;
         for (size_t i = 0; i < to_del; ++i) {
-            clauses[(size_t)cand[i]].deleted = true;
+            Clause& c = clauses[(size_t)cand[i]];
+            c.deleted = true;
+            // Release memory aggressively (we never physically compact clause indices).
+            vector<Lit>().swap(c.lits);
         }
     }
 
@@ -1195,16 +1229,17 @@ struct CDCLSolver {
                 } else {
                     // put asserting literal at position 0
                     // ensure learnt[0] is asserting; already set in analyze
-                    bool ok = addClauseInternal(learnt, true, lbd);
+                    int ci = -1;
+                    bool ok = addClauseInternal(learnt, true, lbd, &ci);
                     if (!ok) return {false, {}};
-                    int ci = (int)clauses.size() - 1;
+                    if (ci != -1) {
+                        // enqueue asserting literal with reason
+                        if (!enqueue(clauses[(size_t)ci].lits[0], ci)) return {false, {}};
 
-                    // enqueue asserting literal with reason
-                    if (!enqueue(clauses[(size_t)ci].lits[0], ci)) return {false, {}};
-
-                    // queue to CoverTrace if good
-                    if (ct && lbd <= ct_lbd_max && (int)clauses[(size_t)ci].lits.size() <= ct_maxlen) {
-                        ct_queue.push_back(ci);
+                        // queue to CoverTrace if good
+                        if (ct && lbd <= ct_lbd_max && (int)clauses[(size_t)ci].lits.size() <= ct_maxlen) {
+                            ct_queue.push_back(ci);
+                        }
                     }
                 }
 
@@ -1365,4 +1400,6 @@ int main(int argc, char** argv) {
     cout << "s UNSATISFIABLE\n";
     return 20;
 }
+
+
 
