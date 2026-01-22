@@ -4,3 +4,29 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
 
 [COVERTRACE-SAT as Disjoint Subcube Knowledge Compilation](https://www.academia.edu/147768691/COVERTRACE_SAT_as_Disjoint_Subcube_Knowledge_Compilation_Worst_Case_Fragmentation_Conditional_PH_Collapse_and_Connections_to_Geometric_Complexity_Theory)
 
+
+Compile
+
+    g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat
+
+Pure CoverTrace:
+
+    ./covertrace_sat --covertrace input.cnf
+
+Pure CDCL:
+
+    ./covertrace_sat --cdcl input.cnf
+
+Hybrid (default): Start with CoverTrace and switch to CDCL if it becomes costly:
+
+    ./covertrace_sat --hybrid input.cnf
+
+Switch to CDCL if |U| exceeds a certain size:
+
+    ./covertrace_sat --hybrid --switch-u 300000 input.
+
+Switch to CDCL if CoverTrace takes more than X ms:
+
+    ./covertrace_sat --hybrid --switch-ms 5000 input.cnf
+  
+
