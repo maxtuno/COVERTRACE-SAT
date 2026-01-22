@@ -228,6 +228,7 @@ static PreprocessResult preprocess_cnf(const CNF& cnf) {
         // Unit propagation
         deque<int> unit_queue;
         for (auto &c : cls) {
+            if (c.size() == 1 && c[0] == INT_MAX) continue; // already satisfied marker
             bool satisfied = false;
             vector<int> newc;
             newc.reserve(c.size());
@@ -259,6 +260,7 @@ static PreprocessResult preprocess_cnf(const CNF& cnf) {
         // Pure literal elimination
         vector<int8_t> seen_pos(n, 0), seen_neg(n, 0);
         for (auto &c : cls) {
+            if (c.size() == 1 && c[0] == INT_MAX) continue; // already satisfied marker
             if (c.size() == 1 && c[0] == INT_MAX) continue;
             for (int lit : c) {
                 int v = var_of(lit);
@@ -278,6 +280,7 @@ static PreprocessResult preprocess_cnf(const CNF& cnf) {
     vector<vector<int>> simplified;
     simplified.reserve(cls.size());
     for (auto &c : cls) {
+            if (c.size() == 1 && c[0] == INT_MAX) continue; // already satisfied marker
         if (c.size() == 1 && c[0] == INT_MAX) continue;
         bool sat = false;
         vector<int> newc;
@@ -894,6 +897,626 @@ static bool eval_cnf(const vector<vector<int>>& clauses, const vector<int>& x) {
     return true;
 }
 
+// =====================
+// CDCL Solver (watched literals + 1-UIP learning)
+// Heuristics: VSIDS, phase saving, Luby restarts, LBD, learnt clause deletion
+// =====================
+struct CDCLSolver {
+    struct Clause {
+        vector<int> lits;      // encoded literals (v*2 + sign), sign=1 means negated
+        int w0 = 0, w1 = 0;    // indices into lits
+        bool learnt = false;
+        bool deleted = false;
+        float activity = 0.0f;
+        int lbd = 0;
+        Clause() = default;
+        Clause(vector<int> ls, bool lr=false): lits(std::move(ls)), learnt(lr) {
+            w0 = 0;
+            w1 = (lits.size() > 1) ? 1 : 0;
+        }
+    };
+
+    int n = 0;
+
+    // Clause database
+    vector<Clause> cs;
+    vector<int> learnts;
+
+    // Watches: for each literal, list of clause indices watching that literal
+    vector<vector<int>> watches;
+
+    // Assignment state
+    vector<int8_t> assigns;     // -1 unassigned, 0 false, 1 true
+    vector<int> level;          // decision level per var
+    vector<int> reason;         // clause index, -1 decision / none
+    vector<int> trail;          // assigned literals
+    vector<int> trail_lim;      // indices into trail where each decision level starts
+    int qhead = 0;
+
+    // VSIDS
+    vector<double> var_act;
+    double var_inc = 1.0;
+    double var_decay = 0.95;
+
+    // Phase saving (preferred value for var: 0/1)
+    vector<int8_t> polarity;
+
+    // Helpers
+    vector<uint8_t> seen;
+    vector<int> seen_vars; // to clear fast
+
+    // Heap for decision variables
+    struct VarHeap {
+        vector<int> heap;
+        vector<int> pos; // -1 not in heap
+        vector<double>* act = nullptr;
+
+        explicit VarHeap(int n=0, vector<double>* a=nullptr) { init(n, a); }
+
+        void init(int n, vector<double>* a) {
+            act = a;
+            heap.clear();
+            pos.assign(n, -1);
+        }
+
+        inline bool higher(int x, int y) const { return (*act)[x] > (*act)[y]; }
+
+        void percolateUp(int i) {
+            int x = heap[i];
+            while (i > 0) {
+                int p = (i - 1) >> 1;
+                if (!higher(x, heap[p])) break;
+                heap[i] = heap[p];
+                pos[heap[i]] = i;
+                i = p;
+            }
+            heap[i] = x;
+            pos[x] = i;
+        }
+
+        void percolateDown(int i) {
+            int x = heap[i];
+            int n = (int)heap.size();
+            while (true) {
+                int l = i*2 + 1;
+                if (l >= n) break;
+                int r = l + 1;
+                int best = (r < n && higher(heap[r], heap[l])) ? r : l;
+                if (!higher(heap[best], x)) break;
+                heap[i] = heap[best];
+                pos[heap[i]] = i;
+                i = best;
+            }
+            heap[i] = x;
+            pos[x] = i;
+        }
+
+        void insert(int v) {
+            if (pos[v] != -1) return;
+            pos[v] = (int)heap.size();
+            heap.push_back(v);
+            percolateUp(pos[v]);
+        }
+
+        bool empty() const { return heap.empty(); }
+
+        int removeMax() {
+            int x = heap[0];
+            int y = heap.back();
+            heap.pop_back();
+            pos[x] = -1;
+            if (!heap.empty()) {
+                heap[0] = y;
+                pos[y] = 0;
+                percolateDown(0);
+            }
+            return x;
+        }
+
+        void update(int v) {
+            int i = pos[v];
+            if (i == -1) return;
+            percolateUp(i);
+        }
+    } heap;
+
+    // Restart (Luby)
+    long long conflicts = 0;
+    long long next_restart = 0;
+    int luby_idx = 1;
+    int restart_inc = 100;
+
+    // Clause deletion
+    long long next_reduce = 0;
+    long long reduce_inc = 2000;
+
+    explicit CDCLSolver(int nvars): n(nvars) {
+        watches.assign(2*n, {});
+        assigns.assign(n, -1);
+        level.assign(n, 0);
+        reason.assign(n, -1);
+        var_act.assign(n, 0.0);
+        polarity.assign(n, 1);
+        seen.assign(n, 0);
+        heap.init(n, &var_act);
+        for (int v = 0; v < n; ++v) heap.insert(v);
+
+        next_restart = restart_inc; // will be luby()*restart_inc
+        next_reduce  = reduce_inc;
+    }
+
+    static inline int toLitDimacs(int x) {
+        int v = abs(x) - 1;
+        int s = (x < 0) ? 1 : 0;
+        return (v << 1) | s;
+    }
+    static inline int var(int lit) { return lit >> 1; }
+    static inline int neg(int lit) { return lit ^ 1; }
+    static inline int sign(int lit) { return lit & 1; }
+
+    inline int valueLit(int lit) const {
+        int v = var(lit);
+        int a = assigns[v];
+        if (a < 0) return -1;
+        // lit is true iff a XOR sign(lit) == 1
+        return (a ^ sign(lit)) ? 1 : 0;
+    }
+
+    inline int decisionLevel() const { return (int)trail_lim.size(); }
+
+    void set_initial_heuristics(const vector<double>& init_act, const vector<char>& init_pol) {
+        for (int v = 0; v < n; ++v) {
+            if (v < (int)init_act.size()) var_act[v] = init_act[v];
+            if (v < (int)init_pol.size()) polarity[v] = init_pol[v] ? 1 : 0;
+        }
+        // rebuild heap
+        heap.init(n, &var_act);
+        for (int v = 0; v < n; ++v) heap.insert(v);
+    }
+
+    void bumpVar(int v) {
+        var_act[v] += var_inc;
+        if (var_act[v] > 1e100) {
+            // rescale
+            for (double &x : var_act) x *= 1e-100;
+            var_inc *= 1e-100;
+        }
+        heap.update(v);
+    }
+    void decayVar() { var_inc /= var_decay; }
+
+    void bumpClause(int ci) {
+        if (ci < 0) return;
+        cs[ci].activity += 1.0f;
+    }
+
+    bool enqueue(int lit, int from) {
+        int v = var(lit);
+        int val = sign(lit) ? 0 : 1; // satisfy lit
+        int cur = assigns[v];
+        if (cur != -1) return cur == val;
+        assigns[v] = (int8_t)val;
+        level[v] = decisionLevel();
+        reason[v] = from;
+        polarity[v] = (int8_t)val; // phase saving
+        trail.push_back(lit);
+        return true;
+    }
+
+    void newDecisionLevel() { trail_lim.push_back((int)trail.size()); }
+
+    void cancelUntil(int lvl) {
+        if (decisionLevel() <= lvl) return;
+        int lim = (lvl == 0) ? 0 : trail_lim[lvl-1];
+        for (int i = (int)trail.size() - 1; i >= lim; --i) {
+            int v = var(trail[i]);
+            assigns[v] = -1;
+            reason[v] = -1;
+        }
+        trail.resize(lim);
+        trail_lim.resize(lvl);
+        qhead = min(qhead, (int)trail.size());
+    }
+
+    // Attach clause to watch lists
+    void attachClause(int ci) {
+        Clause &c = cs[ci];
+        if (c.lits.empty()) return;
+        if (c.lits.size() == 1) {
+            watches[c.lits[0]].push_back(ci);
+        } else {
+            watches[c.lits[c.w0]].push_back(ci);
+            watches[c.lits[c.w1]].push_back(ci);
+        }
+    }
+
+    // Add clause from DIMACS ints; returns false if detects contradiction at level 0.
+    bool addClauseDimacs(const vector<int>& dimacs) {
+        vector<int> lits;
+        lits.reserve(dimacs.size());
+        for (int x : dimacs) {
+            if (x == 0) continue;
+            int l = toLitDimacs(x);
+            int v = var(l);
+            if (v < 0 || v >= n) continue;
+            lits.push_back(l);
+        }
+        // remove duplicates / tautologies
+        sort(lits.begin(), lits.end());
+        lits.erase(unique(lits.begin(), lits.end()), lits.end());
+        for (size_t i = 1; i < lits.size(); ++i) {
+            if (lits[i] == (lits[i-1] ^ 1)) return true; // tautology, ignore
+        }
+        if (lits.empty()) return false; // empty clause => UNSAT
+
+        // create clause
+        int ci = (int)cs.size();
+        cs.emplace_back(std::move(lits), false);
+        attachClause(ci);
+        return true;
+    }
+
+    // Watched-literal propagation. Returns conflicting clause index or -1.
+    int propagate() {
+        while (qhead < (int)trail.size()) {
+            int p = trail[qhead++]; // p is true
+            int f = neg(p);         // literal that just became false
+            auto &ws = watches[f];
+            int i = 0;
+            for (int k = 0; k < (int)ws.size(); ++k) {
+                int ci = ws[k];
+                Clause &c = cs[ci];
+                if (c.deleted) continue;
+
+                if (c.lits.size() == 1) {
+                    int only = c.lits[0];
+                    int v = valueLit(only);
+                    ws[i++] = ci;
+                    if (v == 0) return ci;
+                    if (v == -1) {
+                        if (!enqueue(only, ci)) return ci;
+                    }
+                    continue;
+                }
+
+                // Ensure f is one of the watched literals
+                int w0lit = c.lits[c.w0];
+                int w1lit = c.lits[c.w1];
+                int theW = (w0lit == f) ? c.w0 : c.w1;
+                int othW = (theW == c.w0) ? c.w1 : c.w0;
+                int other = c.lits[othW];
+
+                if (valueLit(other) == 1) { // clause already satisfied
+                    ws[i++] = ci;
+                    continue;
+                }
+
+                // Try to find new watch
+                bool found = false;
+                for (int t = 0; t < (int)c.lits.size(); ++t) {
+                    if (t == othW || t == theW) continue;
+                    int lit = c.lits[t];
+                    int val = valueLit(lit);
+                    if (val != 0) { // true or unassigned
+                        // move watch from f to lit
+                        if (theW == c.w0) c.w0 = t;
+                        else c.w1 = t;
+                        watches[lit].push_back(ci);
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+
+                // No replacement: clause is unit or conflict
+                ws[i++] = ci;
+                int ov = valueLit(other);
+                if (ov == 0) return ci; // conflict
+                if (ov == -1) {
+                    if (!enqueue(other, ci)) return ci;
+                }
+            }
+            ws.resize(i);
+        }
+        return -1;
+    }
+
+    // Luby sequence (Minisat-style)
+    static int luby(int y, int x) {
+        int size = 1;
+        int seq = 0;
+        while (size < x + 1) {
+            size = 2 * size + 1;
+            ++seq;
+        }
+        while (size - 1 != x) {
+            size = (size - 1) >> 1;
+            --seq;
+            x = x % size;
+        }
+        return (int)pow(y, seq);
+    }
+
+    int pickBranchLit() {
+        while (!heap.empty()) {
+            int v = heap.removeMax();
+            if (assigns[v] != -1) continue;
+            int pol = polarity[v];
+            // polarity is preferred var value; choose lit that sets var to pol
+            return (v << 1) | (pol ? 0 : 1);
+        }
+        return -1;
+    }
+
+    // Compute LBD for a clause (unique decision levels, excluding level 0)
+    int computeLBD(const vector<int>& lits) {
+        int dl = decisionLevel();
+        static vector<int> stamp;
+        static int cur = 1;
+        if ((int)stamp.size() < dl + 1) stamp.assign(dl + 1, 0);
+        if (++cur == INT_MAX) { fill(stamp.begin(), stamp.end(), 0); cur = 1; }
+        int cnt = 0;
+        for (int lit : lits) {
+            int lv = level[var(lit)];
+            if (lv == 0) continue;
+            if (lv >= (int)stamp.size()) {
+                stamp.resize(lv + 1, 0);
+            }
+            if (stamp[lv] != cur) {
+                stamp[lv] = cur;
+                ++cnt;
+            }
+        }
+        return max(1, cnt);
+    }
+
+    // Simple clause minimization (safe, not super aggressive)
+    void minimizeClause(vector<int>& learnt) {
+        // mark vars in learnt
+        for (size_t i = 1; i < learnt.size(); ++i) {
+            int v = var(learnt[i]);
+            if (!seen[v]) { seen[v] = 1; seen_vars.push_back(v); }
+        }
+
+        size_t w = 1;
+        for (size_t i = 1; i < learnt.size(); ++i) {
+            int lit = learnt[i];
+            int v = var(lit);
+            int rc = reason[v];
+            if (rc == -1) {
+                learnt[w++] = lit;
+                continue;
+            }
+            bool redundant = true;
+            const Clause& r = cs[rc];
+            for (int q : r.lits) {
+                int vq = var(q);
+                if (level[vq] == 0) continue;
+                if (!seen[vq]) { redundant = false; break; }
+            }
+            if (!redundant) learnt[w++] = lit;
+        }
+        learnt.resize(w);
+
+        // clear marks
+        for (int v : seen_vars) seen[v] = 0;
+        seen_vars.clear();
+    }
+
+    // Analyze conflict, produce learned clause and backtrack level
+    void analyze(int confl, vector<int>& out_learnt, int& out_bt, int& out_lbd) {
+        out_learnt.clear();
+        out_learnt.push_back(-1); // will be asserting literal
+
+        int pathC = 0;
+        int p = -1;
+        int idx = (int)trail.size() - 1;
+
+        // seen[] over vars
+        auto mark = [&](int v){
+            if (!seen[v]) { seen[v] = 1; seen_vars.push_back(v); }
+        };
+
+        out_bt = 0;
+        int cidx = confl;
+        while (true) {
+            Clause *c = (cidx >= 0) ? &cs[cidx] : nullptr;
+            if (c && !c->deleted) {
+                if (c->learnt) bumpClause(cidx);
+                for (int q : c->lits) {
+                    int v = var(q);
+                    if (level[v] == 0 || seen[v]) continue;
+                    mark(v);
+                    bumpVar(v);
+                    if (level[v] == decisionLevel()) ++pathC;
+                    else {
+                        out_learnt.push_back(q);
+                        out_bt = max(out_bt, level[v]);
+                    }
+                }
+            }
+
+            // Select next literal p on the trail
+            while (true) {
+                p = trail[idx--];
+                if (seen[var(p)]) break;
+            }
+
+            int vp = var(p);
+            // UIP reached?
+            if (--pathC == 0) break;
+
+            // Continue with reason clause of p
+            cidx = reason[vp];
+            // unmark vp so it can appear later in minimization logic
+            // (we'll clear all marks at end anyway)
+        }
+
+        out_learnt[0] = neg(p);
+
+        // Put highest-level literal as second
+        if (out_learnt.size() > 2) {
+            int best = 1;
+            for (size_t i = 2; i < out_learnt.size(); ++i) {
+                if (level[var(out_learnt[i])] > level[var(out_learnt[best])]) best = (int)i;
+            }
+            swap(out_learnt[1], out_learnt[best]);
+        }
+
+        // Minimization (optional but standard-ish)
+        if (out_learnt.size() > 2) minimizeClause(out_learnt);
+
+        out_lbd = computeLBD(out_learnt);
+
+        // Clear seen marks
+        for (int v : seen_vars) seen[v] = 0;
+        seen_vars.clear();
+    }
+
+    int addLearntClause(vector<int> lits, int lbd) {
+        // Remove duplicate literals / tautology
+        sort(lits.begin(), lits.end());
+        lits.erase(unique(lits.begin(), lits.end()), lits.end());
+        for (size_t i = 1; i < lits.size(); ++i) {
+            if (lits[i] == (lits[i-1] ^ 1)) {
+                // tautology, shouldn't happen; ignore by turning into satisfied clause
+                return -1;
+            }
+        }
+        // Ensure asserting lit is first
+        // (analysis already did)
+        int ci = (int)cs.size();
+        cs.emplace_back(std::move(lits), true);
+        cs[ci].lbd = lbd;
+        attachClause(ci);
+        learnts.push_back(ci);
+        return ci;
+    }
+
+    bool clauseLocked(int ci) const {
+        const Clause& c = cs[ci];
+        for (int lit : c.lits) {
+            int v = var(lit);
+            if (assigns[v] != -1 && reason[v] == ci) return true;
+        }
+        return false;
+    }
+
+    void reduceDB() {
+        // Collect deletable learnt clauses (skip binaries and locked)
+        vector<int> cand;
+        cand.reserve(learnts.size());
+        for (int ci : learnts) {
+            if (ci < 0) continue;
+            Clause& c = cs[ci];
+            if (c.deleted) continue;
+            if (c.lits.size() <= 2) continue;
+            if (clauseLocked(ci)) continue;
+            cand.push_back(ci);
+        }
+        if (cand.empty()) return;
+
+        // Sort by (lbd ascending, activity descending) and delete worst half
+        sort(cand.begin(), cand.end(), [&](int a, int b){
+            const Clause& A = cs[a];
+            const Clause& B = cs[b];
+            if (A.lbd != B.lbd) return A.lbd < B.lbd;
+            return A.activity > B.activity;
+        });
+
+        int to_del = (int)cand.size() / 2;
+        for (int i = cand.size() - 1; i >= 0 && to_del > 0; --i, --to_del) {
+            int ci = cand[i];
+            cs[ci].deleted = true;
+        }
+        // compact learnts list
+        size_t w = 0;
+        for (int ci : learnts) {
+            if (ci >= 0 && !cs[ci].deleted) learnts[w++] = ci;
+        }
+        learnts.resize(w);
+    }
+
+    bool allAssigned() const {
+        for (int v = 0; v < n; ++v) if (assigns[v] == -1) return false;
+        return true;
+    }
+
+    // Solve. Returns true if SAT, false if UNSAT.
+    bool solve(vector<int>& model_out) {
+        // Root-level propagation (also handles unit clauses discovered during propagation)
+        int confl = propagate();
+        if (confl != -1) return false;
+
+        conflicts = 0;
+        luby_idx = 1;
+        next_restart = restart_inc * luby(2, luby_idx);
+        next_reduce  = reduce_inc;
+
+        while (true) {
+            confl = propagate();
+            if (confl != -1) {
+                ++conflicts;
+
+                if (decisionLevel() == 0) return false;
+
+                vector<int> learnt;
+                int bt = 0, lbd = 0;
+                analyze(confl, learnt, bt, lbd);
+
+                cancelUntil(bt);
+
+                int ci = addLearntClause(learnt, lbd);
+                if (ci >= 0) {
+                    // enqueue asserting literal with reason
+                    enqueue(cs[ci].lits[0], ci);
+                } else {
+                    // should not happen, but be safe: just continue
+                    enqueue(learnt[0], -1);
+                }
+
+                decayVar();
+
+                // Restarts
+                if (conflicts >= next_restart) {
+                    cancelUntil(0);
+                    ++luby_idx;
+                    next_restart = conflicts + (long long)restart_inc * luby(2, luby_idx);
+                }
+
+                // Clause DB reduction
+                if (conflicts >= next_reduce) {
+                    reduceDB();
+                    next_reduce = conflicts + reduce_inc;
+                }
+
+            } else {
+                if (allAssigned()) {
+                    model_out.assign(n, 0);
+                    for (int v = 0; v < n; ++v) {
+                        int a = assigns[v];
+                        model_out[v] = (a == -1) ? 0 : a;
+                    }
+                    return true;
+                }
+                int next = pickBranchLit();
+                if (next == -1) {
+                    // No decision var left, SAT
+                    model_out.assign(n, 0);
+                    for (int v = 0; v < n; ++v) {
+                        int a = assigns[v];
+                        model_out[v] = (a == -1) ? 0 : a;
+                    }
+                    return true;
+                }
+                newDecisionLevel();
+                enqueue(next, -1);
+            }
+        }
+    }
+};
+
+
 int main(int argc, char** argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
@@ -902,15 +1525,29 @@ int main(int argc, char** argv) {
     bool opt_sort = false;
     string path;
 
+    // Solver mode
+    enum Mode { COVERTRACE, CDCL, HYBRID } mode = HYBRID;
+
+    // Hybrid switching thresholds
+    long long switch_u = 200000;     // if |U| grows beyond this, switch to CDCL
+    long long switch_ms = 2000;      // or if time spent in covertrace exceeds this (ms)
+
     for (int i = 1; i < argc; ++i) {
         string s = argv[i];
         if (s == "--compress") opt_compress = true;
         else if (s == "--sort-clauses") opt_sort = true;
+        else if (s == "--covertrace") mode = COVERTRACE;
+        else if (s == "--cdcl") mode = CDCL;
+        else if (s == "--hybrid") mode = HYBRID;
+        else if (s == "--switch-u" && i + 1 < argc) switch_u = atoll(argv[++i]);
+        else if (s == "--switch-ms" && i + 1 < argc) switch_ms = atoll(argv[++i]);
         else path = s;
     }
 
     if (path.empty()) {
-        cerr << "c usage: " << argv[0] << " [--compress] [--sort-clauses] <input.cnf>\n";
+        cerr << "c usage: " << argv[0]
+             << " [--compress] [--sort-clauses] [--covertrace|--cdcl|--hybrid]"
+             << " [--switch-u N] [--switch-ms MS] <input.cnf>\n";
         return 1;
     }
 
@@ -931,10 +1568,90 @@ int main(int argc, char** argv) {
              [](const auto& a, const auto& b){ return a.size() < b.size(); });
     }
 
-    // Build multi-signature index over reduced CNF
+    // If no reduced vars or no clauses => SAT
+    if (n == 0 || clauses.empty()) {
+        vector<int> x_full = P.assign_full;
+        for (int i = 0; i < (int)x_full.size(); ++i)
+            if (x_full[i] == -1) x_full[i] = 0;
+
+        cout << "s SATISFIABLE\n";
+        cout << "v ";
+        for (int i = 0; i < cnf.n; ++i) {
+            int lit = (x_full[i] == 1) ? (i + 1) : -(i + 1);
+            cout << lit << " ";
+        }
+        cout << "0\n";
+        return 10;
+    }
+
+    // Precompute initial CDCL heuristics (occurrence-based)
+    vector<double> init_act(n, 0.0);
+    vector<char> init_pol(n, 1);
+    {
+        vector<int> posc(n, 0), negc(n, 0);
+        for (auto &c : clauses) {
+            for (int lit : c) {
+                int v = abs(lit) - 1;
+                if (v < 0 || v >= n) continue;
+                if (lit > 0) posc[v]++; else negc[v]++;
+            }
+        }
+        for (int v = 0; v < n; ++v) {
+            init_act[v] = (double)(posc[v] + negc[v]);
+            init_pol[v] = (posc[v] >= negc[v]) ? 1 : 0; // prefer more frequent sign
+        }
+    }
+
+    auto run_cdcl = [&]() -> pair<bool, vector<int>> {
+        CDCLSolver S(n);
+        S.set_initial_heuristics(init_act, init_pol);
+
+        for (auto &c : clauses) {
+            if (!S.addClauseDimacs(c)) {
+                return {false, {}};
+            }
+        }
+
+        vector<int> model_red;
+        bool sat = S.solve(model_red);
+        return {sat, model_red};
+    };
+
+    auto print_model = [&](bool sat, const vector<int>& model_red) {
+        if (!sat) {
+            cout << "s UNSATISFIABLE\n";
+            return;
+        }
+        // Reconstruct full assignment
+        vector<int> x_full = P.assign_full;
+        for (int newv = 0; newv < n; ++newv) {
+            int oldv = P.new_to_old[newv];
+            int val = (newv < (int)model_red.size()) ? model_red[newv] : 0;
+            x_full[oldv] = val;
+        }
+        for (int i = 0; i < (int)x_full.size(); ++i)
+            if (x_full[i] == -1) x_full[i] = 0;
+
+        // optional verify
+        (void)eval_cnf(cnf.clauses, x_full);
+
+        cout << "s SATISFIABLE\n";
+        cout << "v ";
+        for (int i = 0; i < cnf.n; ++i) {
+            int lit = (x_full[i] == 1) ? (i + 1) : -(i + 1);
+            cout << lit << " ";
+        }
+        cout << "0\n";
+    };
+
+    if (mode == CDCL) {
+        auto [sat, model_red] = run_cdcl();
+        print_model(sat, model_red);
+        return sat ? 10 : 20;
+    }
+
+    // COVERTRACE / HYBRID
     MultiIndex midx;
-    // Defaults: 3 signatures of 8 vars each (disjoint) => up to 24 vars used.
-    // If n is small, it will auto-shrink.
     midx.init_from_cnf(clauses, n, /*nsig=*/3, /*t_each=*/8);
 
     vector<Cube> U;
@@ -942,6 +1659,9 @@ int main(int argc, char** argv) {
     midx.rebuild(U);
 
     BigInt y = BigInt::pow2(n); // #survivors over reduced vars
+
+    bool switched = false;
+    auto t0 = chrono::steady_clock::now();
 
     for (size_t j = 0; j < clauses.size(); ++j) {
         Cube Q(n);
@@ -962,30 +1682,26 @@ int main(int argc, char** argv) {
             buddy_compress(U, 2);
             midx.rebuild(U);
         }
+
+        if (mode == HYBRID) {
+            if ((long long)U.size() > switch_u) { switched = true; break; }
+            auto now = chrono::steady_clock::now();
+            long long ms = chrono::duration_cast<chrono::milliseconds>(now - t0).count();
+            if (ms > switch_ms) { switched = true; break; }
+        }
     }
 
-    // SAT: extract witness in reduced vars
-    vector<int> x_red = extract_witness_fast(U, n);
-    if (x_red.empty()) x_red.assign(n, 0);
-
-    // Reconstruct full assignment
-    vector<int> x_full = P.assign_full;
-    for (int newv = 0; newv < n; ++newv) {
-        int oldv = P.new_to_old[newv];
-        x_full[oldv] = x_red[newv];
+    if (!switched) {
+        // SAT via covertrace: extract witness in reduced vars
+        vector<int> x_red = extract_witness_fast(U, n);
+        if (x_red.empty()) x_red.assign(n, 0);
+        print_model(true, x_red);
+        return 10;
     }
-    for (int i = 0; i < (int)x_full.size(); ++i)
-        if (x_full[i] == -1) x_full[i] = 0;
 
-    // (Optional) verify original CNF; should pass if everything is correct.
-    (void)eval_cnf(cnf.clauses, x_full);
-
-    cout << "s SATISFIABLE\n";
-    cout << "v ";
-    for (int i = 0; i < cnf.n; ++i) {
-        int lit = (x_full[i] == 1) ? (i + 1) : -(i + 1);
-        cout << lit << " ";
-    }
-    cout << "0\n";
-    return 10;
+    // Hybrid fallback: run CDCL on the reduced CNF
+    auto [sat, model_red] = run_cdcl();
+    print_model(sat, model_red);
+    return sat ? 10 : 20;
 }
+
