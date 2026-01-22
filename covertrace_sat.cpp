@@ -107,8 +107,44 @@ struct BigInt {
         normalize();
     }
 
-    void add_pow2(int exp) { add(pow2(exp)); }
-    void sub_pow2(int exp) { sub(pow2(exp)); }
+    void add_pow2(int exp) {
+        if (exp < 0) return;
+        size_t limb = (size_t)(exp / 32);
+        uint32_t bit = 1u << (exp % 32);
+        if (a.size() <= limb) a.resize(limb + 1, 0);
+        uint64_t s = (uint64_t)a[limb] + (uint64_t)bit;
+        a[limb] = (uint32_t)(s & 0xFFFFFFFFu);
+        uint64_t carry = s >> 32;
+        size_t i = limb + 1;
+        while (carry) {
+            if (a.size() <= i) a.push_back(0);
+            uint64_t t = (uint64_t)a[i] + carry;
+            a[i] = (uint32_t)(t & 0xFFFFFFFFu);
+            carry = t >> 32;
+            ++i;
+        }
+    }
+    void sub_pow2(int exp) {
+        if (exp < 0) return;
+        size_t limb = (size_t)(exp / 32);
+        uint32_t bit = 1u << (exp % 32);
+        // assumes *this >= 2^exp
+        if (limb >= a.size()) { cerr << "c ERROR: sub_pow2 underflow\n"; exit(1); }
+        uint64_t cur = (uint64_t)a[limb];
+        if (cur >= bit) {
+            a[limb] = (uint32_t)(cur - bit);
+        } else {
+            a[limb] = (uint32_t)((cur + (1ull << 32)) - bit);
+            size_t i = limb + 1;
+            while (true) {
+                if (i >= a.size()) { cerr << "c ERROR: sub_pow2 underflow\n"; exit(1); }
+                if (a[i] != 0) { a[i]--; break; }
+                a[i] = 0xFFFFFFFFu;
+                ++i;
+            }
+        }
+        normalize();
+    }
 };
 
 // =====================
@@ -361,52 +397,80 @@ static inline BigInt cube_volume_big(const Cube& c) {
 // =====================
 // CubeDiff(p, r): disjoint family whose union is Q(p)\Q(r)
 // =====================
-static void cube_diff_rec(const Cube& p, const Cube& r, vector<Cube>& out) {
-    if (!intersects(p, r)) { out.push_back(p); return; }
+static void cube_diff_rec(const Cube& p_in, const Cube& r, vector<Cube>& out) {
+    // Computes a disjoint family whose union is Q(p) \ Q(r).
+    // Iterative form: avoids recursion + one extra Cube copy per level.
+    Cube p = p_in;
+
+    if (!intersects(p, r)) { out.push_back(std::move(p)); return; }
     if (subset(p, r)) return;
 
-    int cut = -1;
-    int rv = 0;
-    for (int wi = 0; wi < p.W && cut < 0; ++wi) {
-        uint64_t cand = r.fixed[wi] & ~p.fixed[wi];
-        if (cand) {
-            int b = __builtin_ctzll(cand);
-            cut = wi * 64 + b;
-            uint64_t bit = 1ull << b;
-            rv = (r.value[wi] & bit) ? 1 : 0;
+    while (true) {
+        int cut = -1;
+        int rv = 0;
+
+        // Find a variable fixed in r but free in p
+        for (int wi = 0; wi < p.W && cut < 0; ++wi) {
+            uint64_t cand = r.fixed[wi] & ~p.fixed[wi];
+            if (cand) {
+                int b = __builtin_ctzll(cand);
+                cut = wi * 64 + b;
+                uint64_t bit = 1ull << b;
+                rv = (r.value[wi] & bit) ? 1 : 0;
+            }
         }
+
+        // No such variable => r fixes no additional vars; since p intersects r, p ⊆ r.
+        if (cut < 0) return;
+
+        // Branch that avoids r (disjoint)
+        Cube other = p;
+        other.set_var(cut, 1 - rv);
+        out.push_back(std::move(other));
+
+        // Continue with the branch that matches r
+        p.set_var(cut, rv);
+        if (subset(p, r)) return;
     }
-    if (cut < 0) return;
-
-    Cube other = p;
-    Cube same  = p;
-    other.set_var(cut, 1 - rv);
-    same.set_var(cut, rv);
-
-    out.push_back(std::move(other));
-    cube_diff_rec(same, r, out);
 }
+
 
 // =====================
 // Clause -> falsification cube (skip tautologies)
 // =====================
 static bool clause_to_cube(const vector<int>& clause, int n, Cube& outCube) {
-    unordered_set<int> pos, neg;
-    pos.reserve(clause.size());
-    neg.reserve(clause.size());
-    for (int lit : clause) {
+    // Build the falsification cube of a clause.
+    // Faster than unordered_set: sort by var and detect tautologies/duplicates.
+    vector<int> lits = clause;
+    for (int &lit : lits) {
         int v = abs(lit);
         if (v < 1 || v > n) { cerr << "c ERROR: bad literal " << lit << "\n"; exit(1); }
-        (lit > 0 ? pos : neg).insert(v);
     }
-    for (int v : pos) if (neg.find(v) != neg.end()) return false; // tautology
+    sort(lits.begin(), lits.end(), [](int a, int b){
+        int va = abs(a), vb = abs(b);
+        if (va != vb) return va < vb;
+        return a < b; // negative before positive
+    });
 
     Cube c(n);
-    for (int v : pos) c.set_var(v - 1, 0);
-    for (int v : neg) c.set_var(v - 1, 1);
+    for (size_t i = 0; i < lits.size(); ) {
+        int v = abs(lits[i]);
+        bool has_neg = false, has_pos = false;
+        // consume all occurrences of v
+        while (i < lits.size() && abs(lits[i]) == v) {
+            if (lits[i] > 0) has_pos = true;
+            else has_neg = true;
+            ++i;
+        }
+        if (has_pos && has_neg) return false; // tautology
+        if (has_pos) c.set_var(v - 1, 0); // to falsify positive literal, set 0
+        else if (has_neg) c.set_var(v - 1, 1); // to falsify negative literal, set 1
+    }
+
     outCube = std::move(c);
     return true;
 }
+
 
 // =====================
 // Signature bucket index
@@ -690,6 +754,21 @@ static BigInt add_cube_disjoint_indexed(vector<Cube>& U, const Cube& Q, MultiInd
     bool fallback = false;
     midx.query_candidates_intersection(U, Q, cand, fallback);
 
+    if (!fallback) {
+        // Tighten the candidate set: signature compatibility is only a filter on a few vars.
+        // If a cube conflicts with Q on any var, it cannot intersect any p ⊆ Q.
+        size_t wr = 0;
+        for (int ri : cand) {
+            if (intersects(U[ri], Q)) cand[wr++] = ri;
+        }
+        cand.resize(wr);
+
+        // If any existing forbidden cube fully contains Q, then Q adds nothing.
+        for (int ri : cand) {
+            if (subset(Q, U[ri])) return BigInt(0);
+        }
+    }
+
     vector<Cube> P;
     P.push_back(Q);
 
@@ -713,7 +792,7 @@ static BigInt add_cube_disjoint_indexed(vector<Cube>& U, const Cube& Q, MultiInd
     }
 
     BigInt delta(0);
-    for (const Cube& p : P) delta.add(cube_volume_big(p));
+    for (const Cube& p : P) delta.add_pow2(p.n - p.popcount_fixed());
 
     int oldSize = (int)U.size();
     U.insert(U.end(), P.begin(), P.end());
@@ -849,7 +928,7 @@ int main(int argc, char** argv) {
 
     if (opt_sort) {
         sort(clauses.begin(), clauses.end(),
-             [](const auto& a, const auto& b){ return a.size() > b.size(); });
+             [](const auto& a, const auto& b){ return a.size() < b.size(); });
     }
 
     // Build multi-signature index over reduced CNF
