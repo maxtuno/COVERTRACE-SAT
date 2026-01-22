@@ -765,6 +765,8 @@ struct CDCLSolver {
     long long decisions = 0;
     long long propagations = 0;
 
+    bool debug = false;
+
     explicit CDCLSolver(int nvars) : n(nvars) {
         watches.assign((size_t)(2*n), {});
         assigns.assign((size_t)n, 0);
@@ -806,9 +808,14 @@ struct CDCLSolver {
     void cancelUntil(int lvl) {
         if (decisionLevel() <= lvl) return;
         // trail_lim[i] stores the trail index where decision level (i+1) starts.
-        // To backtrack to level `lvl`, we must keep assignments up to the start of level (lvl+1),
-        // i.e. trail_lim[lvl]. (For lvl==0 we keep nothing beyond level 0.)
-        int lim = (lvl == 0) ? 0 : trail_lim[(size_t)lvl];
+        // To backtrack to level `lvl`, keep assignments up to the start of level (lvl+1).
+        // For lvl==0, keep root-level assignments (trail indices < trail_lim[0]) if any.
+        int lim = 0;
+        if (lvl == 0) {
+            if (!trail_lim.empty()) lim = trail_lim[0];
+        } else {
+            lim = trail_lim[(size_t)lvl];
+        }
         for (int i = (int)trail.size() - 1; i >= lim; --i) {
             int v = var(trail[(size_t)i]);
             assigns[(size_t)v] = 0;
@@ -819,6 +826,47 @@ struct CDCLSolver {
         trail.resize((size_t)lim);
         trail_lim.resize((size_t)lvl);
         qhead = min(qhead, (int)trail.size());
+    }
+
+    static inline int litToDimacs(Lit p) {
+        int v = var(p) + 1;
+        return sign(p) ? -v : v;
+    }
+
+    void dump_clause(int ci, ostream& os = cerr) const {
+        if (ci < 0 || ci >= (int)clauses.size()) {
+            os << "c clause[" << ci << "] <invalid>\n";
+            return;
+        }
+        const Clause& c = clauses[(size_t)ci];
+        os << "c clause[" << ci << "]" << (c.deleted ? " (deleted)" : "") << " :";
+        for (Lit p : c.lits) os << ' ' << litToDimacs(p);
+        os << " 0\n";
+    }
+
+    void dump_trail(ostream& os = cerr) const {
+        os << "c trail size=" << trail.size() << " qhead=" << qhead
+           << " dl=" << decisionLevel() << "\n";
+        for (size_t i = 0; i < trail.size(); ++i) {
+            Lit p = trail[i];
+            int v = var(p);
+            os << "c  #" << i
+               << " lit=" << litToDimacs(p)
+               << " lvl=" << level[(size_t)v]
+               << " reason=" << reason[(size_t)v]
+               << "\n";
+        }
+    }
+
+    bool clause_falsified(int ci) const {
+        if (ci < 0 || ci >= (int)clauses.size()) return false;
+        const Clause& c = clauses[(size_t)ci];
+        if (c.deleted) return false;
+        for (Lit p : c.lits) {
+            int v = valueLit(p);
+            if (v != -1) return false;
+        }
+        return true;
     }
 
     void attachClause(int ci) {
@@ -942,11 +990,27 @@ struct CDCLSolver {
                 if (valueLit(other) == -1) {
                     while (i < (int)ws.size()) ws[(size_t)j++] = ws[(size_t)i++];
                     ws.resize((size_t)j);
+#ifndef NDEBUG
+                    if (!clause_falsified(ci)) {
+                        cerr << "c ASSERT: conflict clause not falsified (propagate)\n";
+                        dump_clause(ci);
+                        dump_trail();
+                        assert(false);
+                    }
+#endif
                     return ci;
                 }
                 if (!enqueue(other, ci)) {
                     while (i < (int)ws.size()) ws[(size_t)j++] = ws[(size_t)i++];
                     ws.resize((size_t)j);
+#ifndef NDEBUG
+                    if (!clause_falsified(ci)) {
+                        cerr << "c ASSERT: conflict clause not falsified (enqueue)\n";
+                        dump_clause(ci);
+                        dump_trail();
+                        assert(false);
+                    }
+#endif
                     return ci;
                 }
             }
@@ -1209,6 +1273,11 @@ struct CDCLSolver {
             if (confl != -1) {
                 conflicts++;
                 if (decisionLevel() == 0) {
+                    if (debug) {
+                        cerr << "c UNSAT at level 0, confl=" << confl << "\n";
+                        dump_clause(confl);
+                        dump_trail();
+                    }
                     return {false, {}};
                 }
 
@@ -1222,6 +1291,29 @@ struct CDCLSolver {
                 claDecay();
 
                 cancelUntil(bt);
+
+#ifndef NDEBUG
+                if (!learnt.empty()) {
+                    if (valueLit(learnt[0]) != 0) {
+                        cerr << "c ASSERT: asserting literal not unassigned after backtrack\n";
+                        dump_trail();
+                        cerr << "c learnt:";
+                        for (Lit p : learnt) cerr << ' ' << litToDimacs(p);
+                        cerr << " 0\n";
+                        assert(false);
+                    }
+                    for (size_t i = 1; i < learnt.size(); ++i) {
+                        if (valueLit(learnt[i]) != -1) {
+                            cerr << "c ASSERT: learnt clause not unit after backtrack\n";
+                            dump_trail();
+                            cerr << "c learnt:";
+                            for (Lit p : learnt) cerr << ' ' << litToDimacs(p);
+                            cerr << " 0\n";
+                            assert(false);
+                        }
+                    }
+                }
+#endif
 
                 // add learnt clause
                 if (learnt.size() == 1) {
@@ -1400,6 +1492,7 @@ int main(int argc, char** argv) {
     cout << "s UNSATISFIABLE\n";
     return 20;
 }
+
 
 
 
