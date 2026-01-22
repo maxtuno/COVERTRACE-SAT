@@ -6,35 +6,30 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
 
 
 ## Hybrid SAT solver: CDCL (standard heuristics) + interleaved CoverTrace UNSAT detector.
-Soundness: the solver verifies any SAT candidate model before printing SAT.
+
+### Features (CDCL):
+      - 2-watched literals propagation
+      - 1-UIP conflict analysis and backjumping
+      - VSIDS variable activity + decay
+      - Phase saving
+      - Luby restarts
+      - LBD scoring (Glucose-style) + learned DB reduction
+      - Final model verification (never prints SAT with invalid assignment)
+
+### Features (Interleaving):
+      - While CDCL runs, we continuously feed a filtered stream of *entailed clauses* (learned clauses with low LBD / small size, plus optionally original clauses) into CoverTrace.
+      - If CoverTrace proves coverage of {0,1}^n, we can conclude UNSAT early.
+      - Optional: CoverTrace witness (when y>0) is used to set CDCL phase preferences.
 
 ### Build:
-
-    g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat
+    g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat_hybrid_interleaved.cpp -o covertrace_sat
 
 ### Run:
+    ./covertrace_sat --interleaved --ct-seed-original test.cnf
+    ./covertrace_sat --cdcl test.cnf
+    ./covertrace_sat --covertrace test.cnf
 
-    ./covertrace_sat [options] input.cnf
 
-### Options:
-    
-    --cdcl            : CDCL only
-    --covertrace      : CoverTrace only (exact, may blow up)
-    --interleaved     : CDCL + interleaved CoverTrace (default)
-
-### Interleaved CoverTrace options:
-
-    --ct-seed-original        : feed original clauses into CoverTrace queue too
-    --ct-every <conflicts>    : run a CoverTrace tick every N CDCL conflicts (default 2000)
-    --ct-batch <k>            : how many clauses to feed per tick (default 128)
-    --ct-lbd <L>              : only feed learned clauses with LBD <= L (default 6)
-    --ct-maxlen <K>           : only feed clauses of length <= K (default 12)
-    --ct-maxu <U>             : pause CoverTrace if |U| exceeds U (default 300000)
-
-### Output is DIMACS-style:
-
-    s SATISFIABLE / s UNSATISFIABLE
-    v <lits...> 0  (only for SAT)
 
 
 
