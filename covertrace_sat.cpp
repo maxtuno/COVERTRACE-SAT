@@ -10,7 +10,7 @@ You should have received a copy of the GNU Affero General Public License along w
 Commercial licensing options are available. See COMMERCIAL.md for details.
 */
 
-// covertrace_sat_hybrid_interleaved.cpp
+// covertrace_sat.cpp
 // Hybrid SAT solver: CDCL (standard heuristics) + interleaved CoverTrace UNSAT detector.
 //
 // Features (CDCL):
@@ -29,7 +29,7 @@ Commercial licensing options are available. See COMMERCIAL.md for details.
 //  - Optional: CoverTrace witness (when y>0) is used to set CDCL phase preferences.
 //
 // Build:
-//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat_hybrid_interleaved.cpp -o covertrace_sat
+//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat
 //
 // Run:
 //   ./covertrace_sat --interleaved --ct-seed-original test.cnf
@@ -1365,3 +1365,4 @@ int main(int argc, char** argv) {
     cout << "s UNSATISFIABLE\n";
     return 20;
 }
+
