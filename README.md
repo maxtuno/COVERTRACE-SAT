@@ -25,10 +25,9 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
     g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat -static
 
 #### Run:
-    ./covertrace_sat --interleaved --ct-seed-original test.cnf
+    ./covertrace_sat --interleaved --ct-no-seed-original test.cnf
     ./covertrace_sat --cdcl test.cnf
     ./covertrace_sat --covertrace test.cnf
-
 
 
 
