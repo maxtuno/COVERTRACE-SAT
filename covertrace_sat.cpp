@@ -1405,7 +1405,7 @@ int main(int argc, char** argv) {
     cin.tie(nullptr);
 
     Mode mode = MODE_INTERLEAVED;
-    bool ct_seed_original = true;
+    bool ct_seed_original = false;
     int ct_every = 64;
     int ct_batch = 16;
     int ct_lbd = 2;
