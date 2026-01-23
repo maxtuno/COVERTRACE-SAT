@@ -1408,7 +1408,7 @@ int main(int argc, char** argv) {
     int ct_lbd = 6;
     int ct_maxlen = 12;
     int ct_witness_phase_every = 5000;
-    size_t ct_maxu = 400000;
+    size_t ct_maxu = 128;
 
     string path;
     for (int i = 1; i < argc; ++i) {
