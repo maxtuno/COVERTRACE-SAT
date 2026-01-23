@@ -1,11 +1,11 @@
-# COVERTRACE-SAT
+# CoverTrace-SAT
 
-I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Compilation.” It reframes CNF-SAT/#SAT geometrically: clauses forbid axis-aligned subcubes of the Boolean hypercube, and we maintain an exact disjoint cover (DSOP-style) so model counting becomes additive and witness extraction is constructive. The paper formalizes correctness, analyzes fragmentation as the central complexity driver, proves explicit exponential worst-case lower bounds for disjoint subcube covers, and discusses the conditional consequence that uniform polynomial-size disjoint-cover compilation would imply #SAT ∈ P and collapse PH. Code is included for reproducibility and benchmarking.
+I’m sharing my new paper, CoverTrace-SAT as Disjoint-Subcube Knowledge Compilation.” It reframes CNF-SAT/#SAT geometrically: clauses forbid axis-aligned subcubes of the Boolean hypercube, and we maintain an exact disjoint cover (DSOP-style) so model counting becomes additive and witness extraction is constructive. The paper formalizes correctness, analyzes fragmentation as the central complexity driver, proves explicit exponential worst-case lower bounds for disjoint subcube covers, and discusses the conditional consequence that uniform polynomial-size disjoint-cover compilation would imply #SAT ∈ P and collapse PH. Code is included for reproducibility and benchmarking.
 
-[COVERTRACE-SAT as Disjoint Subcube Knowledge Compilation](https://www.academia.edu/147768691/COVERTRACE_SAT_as_Disjoint_Subcube_Knowledge_Compilation_Worst_Case_Fragmentation_Conditional_PH_Collapse_and_Connections_to_Geometric_Complexity_Theory)
+[CoverTrace-SAT as Disjoint Subcube Knowledge Compilation](https://www.academia.edu/147768691/COVERTRACE_SAT_as_Disjoint_Subcube_Knowledge_Compilation_Worst_Case_Fragmentation_Conditional_PH_Collapse_and_Connections_to_Geometric_Complexity_Theory)
 
 
-### Hybrid SAT solver: CDCL (standard heuristics) + interleaved CoverTrace UNSAT detector.
+### Hybrid SAT solver: CDCL + CoverTrace-SAT.
 
 #### Features (CDCL):
       - 2-watched literals propagation
@@ -24,16 +24,17 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
 #### Build:
     g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat -static
 
-#### Run:
-    ./covertrace_sat --interleaved --ct-no-seed-original test.cnf
-    ./covertrace_sat --cdcl test.cnf
-    ./covertrace_sat --covertrace test.cnf
+#### Modes:
 
+##### SAT/UNSAT default (hybrid)::
+      ./covertrace_sat instancia.cnf
 
+##### Exact #SAT (if fragmentation doesn't break)
+      ./covertrace_sat --count --ct-maxu 200000 instancia.cnf
 
+##### Only #SAT (or UNKNOWN):
+      ./covertrace_sat --count-only --ct-maxu 200000 instancia.cnf
 
-
-
-
-
+##### CoverTrace-only (SAT + witness):
+      ./covertrace_sat --covertrace --count --ct-maxu 200000 instancia.cnf
 
