@@ -1405,7 +1405,7 @@ int main(int argc, char** argv) {
     cin.tie(nullptr);
 
     Mode mode = MODE_INTERLEAVED;
-    bool ct_seed_original = false;
+    bool ct_seed_original = true;
     int ct_every = 64;
     int ct_batch = 16;
     int ct_lbd = 2;
@@ -1419,7 +1419,7 @@ int main(int argc, char** argv) {
         if (s == "--interleaved" || s == "--interleave") mode = MODE_INTERLEAVED;
         else if (s == "--cdcl" || s == "--cdcl-only") mode = MODE_CDCL;
         else if (s == "--covertrace" || s == "--ct-only") mode = MODE_COVERTRACE;
-        else if (s == "--ct-seed-original") ct_seed_original = true;
+        else if (s == "--ct-no-seed-original") ct_seed_original = false;
         else if (s == "--ct-every" && i + 1 < argc) ct_every = atoi(argv[++i]);
         else if (s == "--ct-batch" && i + 1 < argc) ct_batch = atoi(argv[++i]);
         else if (s == "--ct-lbd" && i + 1 < argc) ct_lbd = atoi(argv[++i]);
