@@ -29,6 +29,10 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
     ./covertrace_sat --cdcl test.cnf
     ./covertrace_sat --covertrace test.cnf
 
+### The WoW parametter "maxu" (this is the key):
+      ./covertrace_sat -ct-maxu 1024 test.cnf
+
+
 
 
 
