@@ -22,12 +22,13 @@ I’m sharing my new paper, “COVERTRACE-SAT as Disjoint-Subcube Knowledge Comp
       - Optional: CoverTrace witness (when y>0) is used to set CDCL phase preferences.
 
 #### Build:
-    g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat_hybrid_interleaved.cpp -o covertrace_sat
+    g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat -static
 
 #### Run:
     ./covertrace_sat --interleaved --ct-seed-original test.cnf
     ./covertrace_sat --cdcl test.cnf
     ./covertrace_sat --covertrace test.cnf
+
 
 
 
