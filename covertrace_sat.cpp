@@ -10,7 +10,7 @@ You should have received a copy of the GNU Affero General Public License along w
 Commercial licensing options are available. See COMMERCIAL.md for details.
 */
 
-// covertrace_sat_hybrid_interleaved.cpp
+// covertrace_sat.cpp
 // Hybrid SAT solver: CDCL (standard heuristics) + interleaved CoverTrace UNSAT detector.
 //
 // Features (CDCL):
@@ -29,7 +29,7 @@ Commercial licensing options are available. See COMMERCIAL.md for details.
 //  - Optional: CoverTrace witness (when y>0) is used to set CDCL phase preferences.
 //
 // Build:
-//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat_hybrid_interleaved.cpp -o covertrace_sat
+//   g++ -O3 -std=c++17 -march=native -DNDEBUG covertrace_sat.cpp -o covertrace_sat -static
 //
 // Run:
 //   ./covertrace_sat --interleaved --ct-seed-original test.cnf
@@ -197,6 +197,41 @@ struct BigInt {
         }
         normalize();
     }
+
+    // Divide by small (fits uint32). Returns remainder.
+    uint32_t div_small(uint32_t m) {
+        if (m == 0) {
+            cerr << "c ERROR: BigInt div by zero\n";
+            exit(1);
+        }
+        uint64_t rem = 0;
+        // Process from most-significant limb to least.
+        for (int i = (int)a.size() - 1; i >= 0; --i) {
+            uint64_t cur = (rem << 32) | (uint64_t)a[(size_t)i];
+            a[(size_t)i] = (uint32_t)(cur / m);
+            rem = cur % m;
+        }
+        normalize();
+        return (uint32_t)rem;
+    }
+
+    string to_dec() const {
+        if (is_zero()) return "0";
+        BigInt tmp = *this;
+        const uint32_t base = 1000000000u; // 1e9
+        vector<uint32_t> parts;
+        parts.reserve(tmp.a.size() * 2);
+        while (!tmp.is_zero()) {
+            parts.push_back(tmp.div_small(base));
+        }
+        string s = to_string(parts.back());
+        char buf[16];
+        for (int i = (int)parts.size() - 2; i >= 0; --i) {
+            snprintf(buf, sizeof(buf), "%09u", parts[(size_t)i]);
+            s += buf;
+        }
+        return s;
+    }
 };
 
 // ============================================================
@@ -326,6 +361,190 @@ static bool clause_to_cube(const vector<int>& clause, int n, Cube& outCube) {
     outCube = std::move(c);
     return true;
 }
+
+// ============================================================
+// CoverTrace "compression" (Appendix A.2): Buddy merges
+// If two disjoint cubes have the same fixed coordinates and differ in exactly one fixed bit,
+// they can be merged by freeing that bit, reducing fragmentation without changing the covered set.
+// ============================================================
+
+static inline void cube_clear_var(Cube& c, int v) {
+    int wi = v >> 6;
+    int bi = v & 63;
+    uint64_t m = 1ull << bi;
+    c.fixed[(size_t)wi] &= ~m;
+    c.value[(size_t)wi] &= ~m;
+}
+
+static inline bool cube_is_fixed(const Cube& c, int v) {
+    int wi = v >> 6;
+    int bi = v & 63;
+    return (c.fixed[(size_t)wi] >> bi) & 1ull;
+}
+
+static inline int cube_fixed_value(const Cube& c, int v) {
+    int wi = v >> 6;
+    int bi = v & 63;
+    return ((c.value[(size_t)wi] >> bi) & 1ull) ? 1 : 0;
+}
+
+static inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static uint64_t cube_signature_hash_clearing_v(const Cube& c, int v) {
+    uint64_t h = 0x243f6a8885a308d3ULL;
+    int wi_clear = v >> 6;
+    uint64_t m_clear = 1ull << (v & 63);
+
+    for (int wi = 0; wi < c.W; ++wi) {
+        uint64_t f = c.fixed[(size_t)wi];
+        uint64_t val = c.value[(size_t)wi];
+        if (wi == wi_clear) {
+            f &= ~m_clear;
+            val &= ~m_clear;
+        }
+        // Only values on fixed positions matter.
+        val &= f;
+        h = splitmix64(h ^ f);
+        h = splitmix64(h ^ val);
+    }
+    // include width to avoid accidental collisions across different n (defensive)
+    h = splitmix64(h ^ (uint64_t)c.W);
+    return h;
+}
+
+// Are a and b buddies on variable v?
+// Preconditions for buddy merge:
+//  1) same fixed coordinates
+//  2) differ in exactly one fixed bit (namely v)
+//  3) thus they are disjoint and their union equals the cube with v freed.
+static inline bool are_buddies_on(const Cube& a, const Cube& b, int v) {
+    int wi = v >> 6;
+    uint64_t m = 1ull << (v & 63);
+
+    // Must both fix v (and hence both have the same fixed mask).
+    if ((a.fixed[(size_t)wi] & m) == 0) return false;
+    if ((b.fixed[(size_t)wi] & m) == 0) return false;
+
+    // Same fixed coordinates.
+    for (int i = 0; i < a.W; ++i) {
+        if (a.fixed[(size_t)i] != b.fixed[(size_t)i]) return false;
+    }
+
+    // Values differ on exactly one fixed bit: v.
+    int diff_count = 0;
+    for (int i = 0; i < a.W; ++i) {
+        uint64_t both = a.fixed[(size_t)i];
+        uint64_t diff = (a.value[(size_t)i] ^ b.value[(size_t)i]) & both;
+        diff_count += __builtin_popcountll(diff);
+        if (diff_count > 1) return false;
+    }
+    if (diff_count != 1) return false;
+
+    // That unique differing bit must be v.
+    uint64_t diff_v = (a.value[(size_t)wi] ^ b.value[(size_t)wi]) & m;
+    return diff_v != 0;
+}
+
+struct BuddyKey {
+    uint64_t sig = 0;
+    uint32_t v = 0;
+
+    bool operator==(const BuddyKey& o) const noexcept {
+        return sig == o.sig && v == o.v;
+    }
+};
+
+struct BuddyKeyHash {
+    size_t operator()(const BuddyKey& k) const noexcept {
+        uint64_t x = k.sig ^ (uint64_t)k.v * 0x9e3779b97f4a7c15ULL;
+        return (size_t)splitmix64(x);
+    }
+};
+
+// One greedy buddy-merge round: finds many disjoint buddy pairs (by key), merges them,
+// and returns true if any merge happened.
+static bool buddy_merge_round(vector<Cube>& U) {
+    if (U.size() < 2) return false;
+
+    unordered_map<BuddyKey, vector<int>, BuddyKeyHash> buckets;
+    buckets.reserve(U.size() * 2);
+
+    // Build buckets: for each cube and each fixed var v, hash signature clearing v.
+    for (int i = 0; i < (int)U.size(); ++i) {
+        const Cube& c = U[(size_t)i];
+        for (int wi = 0; wi < c.W; ++wi) {
+            uint64_t f = c.fixed[(size_t)wi];
+            while (f) {
+                int b = __builtin_ctzll(f);
+                f &= (f - 1);
+                int v = wi * 64 + b;
+                if (v >= c.n) continue;
+                BuddyKey key;
+                key.v = (uint32_t)v;
+                key.sig = cube_signature_hash_clearing_v(c, v);
+                buckets[key].push_back(i);
+            }
+        }
+    }
+
+    vector<char> alive(U.size(), 1);
+    vector<Cube> merged;
+    merged.reserve(U.size() / 8);
+
+    int merges = 0;
+    for (auto& kv : buckets) {
+        auto& vec = kv.second;
+        if (vec.size() < 2) continue;
+
+        sort(vec.begin(), vec.end());
+        vec.erase(unique(vec.begin(), vec.end()), vec.end());
+        if (vec.size() < 2) continue;
+
+        int v = (int)kv.first.v;
+
+        // Usually there will be exactly two indices. If more (hash collision), try pairs.
+        for (size_t a = 0; a < vec.size(); ++a) {
+            int i = vec[a];
+            if (i < 0 || i >= (int)U.size() || !alive[(size_t)i]) continue;
+            for (size_t b = a + 1; b < vec.size(); ++b) {
+                int j = vec[b];
+                if (j < 0 || j >= (int)U.size() || !alive[(size_t)j]) continue;
+                if (!are_buddies_on(U[(size_t)i], U[(size_t)j], v)) continue;
+
+                Cube m = U[(size_t)i];
+                cube_clear_var(m, v);
+                alive[(size_t)i] = 0;
+                alive[(size_t)j] = 0;
+                merged.push_back(std::move(m));
+                merges++;
+                goto next_bucket; // only one merge per key
+            }
+        }
+        next_bucket: ;
+    }
+
+    if (merges == 0) return false;
+
+    vector<Cube> newU;
+    newU.reserve(U.size() - (size_t)merges + merged.size());
+    for (size_t i = 0; i < U.size(); ++i) if (alive[i]) newU.push_back(std::move(U[i]));
+    for (auto& m : merged) newU.push_back(std::move(m));
+    U.swap(newU);
+    return true;
+}
+
+// Run several buddy-merge rounds (iterative closure) with a safety cap.
+static void buddy_compress(vector<Cube>& U, int max_rounds) {
+    for (int r = 0; r < max_rounds; ++r) {
+        if (!buddy_merge_round(U)) break;
+    }
+}
+
 
 struct SignatureIndex {
     int t = 0;
@@ -601,25 +820,66 @@ struct CoverTrace {
     BigInt y;        // remaining measure
     MultiIndex midx;
 
-    explicit CoverTrace(int nvars, const vector<vector<int>>& cnf_clauses)
+    // Compression (Appendix A.2 "Buddy merges")
+    bool enable_buddy_merge = true;
+    size_t merge_minU = 2048;  // don't bother compressing below this size
+    int merge_every = 4096;    // run compression every N successful insertions
+    int merge_rounds = 8;      // max iterative rounds per compression call
+    size_t merge_ticks = 0;
+
+    explicit CoverTrace(int nvars,
+                        const vector<vector<int>>& cnf_clauses,
+                        bool enable_merge = true,
+                        int merge_every_ = 4096,
+                        size_t merge_minU_ = 2048,
+                        int merge_rounds_ = 8)
         : n(nvars), y(BigInt::pow2(nvars)) {
+        enable_buddy_merge = enable_merge;
+        merge_every = merge_every_;
+        merge_minU = merge_minU_;
+        merge_rounds = merge_rounds_;
         midx.init_from_cnf(cnf_clauses, nvars);
         midx.rebuild(U);
+    }
+
+    void maybe_compress() {
+        if (!enable_buddy_merge) return;
+        if (merge_every <= 0) return;
+        if (U.size() < merge_minU) return;
+
+        ++merge_ticks;
+        if ((merge_ticks % (size_t)merge_every) != 0) return;
+
+        size_t before = U.size();
+        buddy_compress(U, merge_rounds);
+        if (U.size() != before) {
+            // Rebuild the heuristic index after deletions/changes.
+            midx.rebuild(U);
+        }
     }
 
     // feed a DIMACS clause; returns true if UNSAT proven (y==0)
     bool feed_clause(const vector<int>& clause) {
         Cube Q;
         if (!clause_to_cube(clause, n, Q)) return false; // tautology
+
+        size_t beforeU = U.size();
         BigInt delta = add_cube_disjoint_indexed(U, Q, midx);
+
         if (!delta.is_zero()) {
             if (BigInt::cmp(y, delta) >= 0) y.sub(delta);
             else y.set_u64(0);
         }
+
+        if (U.size() != beforeU) maybe_compress();
         return y.is_zero();
     }
 
     bool is_unsat() const { return y.is_zero(); }
+
+    // Exact model count (#SAT) for the clauses fed so far.
+    // If you feed *all* original CNF clauses, this equals #SAT(F).
+    const BigInt& count() const { return y; }
 
     // produce a candidate assignment avoiding current forbidden cubes (if any exists)
     vector<int> witness01() const {
@@ -1405,13 +1665,24 @@ int main(int argc, char** argv) {
     cin.tie(nullptr);
 
     Mode mode = MODE_INTERLEAVED;
+    bool want_count = false;      // compute exact #SAT via CoverTrace when feasible
+    bool count_only = false;      // if true, stop after emitting the count/status
+    bool want_stats = false;
+    bool print_model = true;
     bool ct_seed_original = true;
     int ct_every = 64;
     int ct_batch = 16;
     int ct_lbd = 2;
     int ct_maxlen = 4;
     int ct_witness_phase_every = 32;
-    size_t ct_maxu = 8;
+    size_t ct_maxu = 128;
+
+    // CoverTrace compression (buddy merges)
+    bool ct_merge = true;
+    int ct_merge_every = 4096;
+    size_t ct_merge_minU = 2048;
+    int ct_merge_rounds = 8;
+
 
     string path;
     for (int i = 1; i < argc; ++i) {
@@ -1419,6 +1690,10 @@ int main(int argc, char** argv) {
         if (s == "--interleaved" || s == "--interleave") mode = MODE_INTERLEAVED;
         else if (s == "--cdcl" || s == "--cdcl-only") mode = MODE_CDCL;
         else if (s == "--covertrace" || s == "--ct-only") mode = MODE_COVERTRACE;
+        else if (s == "--count" || s == "--sharp") { want_count = true; }
+        else if (s == "--count-only" || s == "--sharp-only") { want_count = true; count_only = true; }
+        else if (s == "--stats") want_stats = true;
+        else if (s == "--no-model") print_model = false;
         else if (s == "--ct-no-seed-original") ct_seed_original = false;
         else if (s == "--ct-every" && i + 1 < argc) ct_every = atoi(argv[++i]);
         else if (s == "--ct-batch" && i + 1 < argc) ct_batch = atoi(argv[++i]);
@@ -1426,38 +1701,125 @@ int main(int argc, char** argv) {
         else if (s == "--ct-maxlen" && i + 1 < argc) ct_maxlen = atoi(argv[++i]);
         else if (s == "--ct-maxu" && i + 1 < argc) ct_maxu = (size_t)atoll(argv[++i]);
         else if (s == "--ct-witness-phase-every" && i + 1 < argc) ct_witness_phase_every = atoi(argv[++i]);
+        else if (s == "--ct-merge") ct_merge = true;
+        else if (s == "--ct-no-merge") ct_merge = false;
+        else if (s == "--ct-merge-every" && i + 1 < argc) ct_merge_every = atoi(argv[++i]);
+        else if (s == "--ct-merge-minu" && i + 1 < argc) ct_merge_minU = (size_t)atoll(argv[++i]);
+        else if (s == "--ct-merge-rounds" && i + 1 < argc) ct_merge_rounds = atoi(argv[++i]);
         else path = s;
     }
 
     if (path.empty()) {
         cerr << "c usage: " << argv[0]
-             << " [--interleaved|--cdcl|--covertrace] [ct options] <input.cnf>\n";
+             << " [--interleaved|--cdcl|--covertrace] [--count|--count-only] [--stats] [--no-model] [ct options] [--ct-no-merge|--ct-merge] [--ct-merge-every N] [--ct-merge-minu N] [--ct-merge-rounds R] <input.cnf>\n";
         return 1;
     }
 
     CNF cnf = parse_dimacs(path);
 
+    // Optional: exact #SAT via CoverTrace (when fragmentation stays manageable).
+    bool exact_count_known = false;
+    string exact_count_str;
+    if (want_count) {
+        CoverTrace ct_count(cnf.n, cnf.clauses, ct_merge, ct_merge_every, ct_merge_minU, ct_merge_rounds);
+        bool exceeded = false;
+        bool proved_unsat = false;
+        for (const auto& c : cnf.clauses) {
+            if (ct_count.feed_clause(c)) { proved_unsat = true; break; }
+            if (ct_count.U.size() > ct_maxu) { exceeded = true; break; }
+        }
+
+        if (!exceeded) {
+            exact_count_known = true;
+            exact_count_str = ct_count.count().to_dec();
+
+            if (proved_unsat || ct_count.is_unsat()) {
+                cout << "c #SAT " << exact_count_str << "\n";
+                cout << "s UNSATISFIABLE\n";
+                return 20;
+            }
+
+            // SAT is guaranteed (#SAT>0). Prefer to emit a verified witness.
+            vector<int> w = ct_count.witness01();
+            if ((int)w.size() == cnf.n && eval_cnf(cnf, w, nullptr)) {
+                cout << "c #SAT " << exact_count_str << "\n";
+                cout << "s SATISFIABLE\n";
+                if (print_model) {
+                    cout << "v ";
+                    for (int v = 0; v < cnf.n; ++v) {
+                        int lit = w[(size_t)v] ? (v + 1) : -(v + 1);
+                        cout << lit << ' ';
+                    }
+                    cout << "0\n";
+                }
+                return 10;
+            }
+
+            // Witness extraction should succeed, but keep robustness.
+            cerr << "c WARNING: CoverTrace produced #SAT>0 but witness verification failed; falling back to CDCL for a model.\n";
+            if (count_only) {
+                cout << "c #SAT " << exact_count_str << "\n";
+                cout << "s SATISFIABLE\n";
+                return 10;
+            }
+        } else {
+            cerr << "c CoverTrace fragmentation exceeded limit (U=" << ct_count.U.size()
+                 << ", --ct-maxu=" << ct_maxu << "); #SAT unavailable, solving with CDCL.\n";
+            if (count_only) {
+                cout << "c #SAT UNKNOWN\n";
+                return 0;
+            }
+        }
+    }
+
     // CoverTrace-only mode can only prove UNSAT (or give up). If it doesn't reach y==0, we fall back to CDCL.
     unique_ptr<CoverTrace> ct_ptr;
 
     if (mode == MODE_COVERTRACE) {
-        CoverTrace ct(cnf.n, cnf.clauses);
+        CoverTrace ct(cnf.n, cnf.clauses, ct_merge, ct_merge_every, ct_merge_minU, ct_merge_rounds);
+        bool exceeded = false;
         for (const auto& c : cnf.clauses) {
             if (ct.feed_clause(c)) {
+                if (want_count) cout << "c #SAT 0\n";
                 cout << "s UNSATISFIABLE\n";
                 return 20;
             }
             if (ct.U.size() > ct_maxu) {
-                cerr << "c CoverTrace U too large (" << ct.U.size() << "); switching to CDCL.\n";
+                exceeded = true;
                 break;
             }
         }
+
+        if (!exceeded) {
+            if (want_count) cout << "c #SAT " << ct.count().to_dec() << "\n";
+            if (ct.is_unsat()) {
+                cout << "s UNSATISFIABLE\n";
+                return 20;
+            }
+            vector<int> w = ct.witness01();
+            if ((int)w.size() == cnf.n && eval_cnf(cnf, w, nullptr)) {
+                cout << "s SATISFIABLE\n";
+                if (print_model) {
+                    cout << "v ";
+                    for (int v = 0; v < cnf.n; ++v) {
+                        int lit = w[(size_t)v] ? (v + 1) : -(v + 1);
+                        cout << lit << ' ';
+                    }
+                    cout << "0\n";
+                }
+                return 10;
+            }
+            cerr << "c WARNING: CoverTrace witness extraction failed; switching to CDCL.\n";
+        } else {
+            cerr << "c CoverTrace U too large (" << ct.U.size() << "); switching to CDCL.\n";
+        }
+
         mode = MODE_INTERLEAVED;
         ct_seed_original = true;
     }
 
     if (mode == MODE_INTERLEAVED) {
-        ct_ptr = make_unique<CoverTrace>(cnf.n, cnf.clauses);
+        ct_ptr = make_unique<CoverTrace>(cnf.n, cnf.clauses, ct_merge, ct_merge_every, ct_merge_minU, ct_merge_rounds);
     }
 
     CDCLSolver solver(cnf.n);
@@ -1480,19 +1842,39 @@ int main(int argc, char** argv) {
 
     auto [sat, model01] = solver.solve(cnf);
 
+    if (exact_count_known) {
+        cout << "c #SAT " << exact_count_str << "\n";
+    }
+
     if (sat) {
         cout << "s SATISFIABLE\n";
-        cout << "v ";
-        for (int v = 0; v < cnf.n; ++v) {
-            int lit = model01[(size_t)v] ? (v + 1) : -(v + 1);
-            cout << lit << ' ';
+        if (print_model) {
+            cout << "v ";
+            for (int v = 0; v < cnf.n; ++v) {
+                int lit = model01[(size_t)v] ? (v + 1) : -(v + 1);
+                cout << lit << ' ';
+            }
+            cout << "0\n";
         }
-        cout << "0\n";
+        if (want_stats) {
+            cerr << "c stats: decisions=" << solver.decisions
+                 << " conflicts=" << solver.conflicts
+                 << " propagations=" << solver.propagations
+                 << " learnt=" << solver.learnt_ids.size() << "\n";
+            if (solver.ct) cerr << "c stats: covertrace_U=" << solver.ct->U.size() << "\n";
+        }
         return 10;
     }
 
     // If interleaved, CoverTrace may have proven UNSAT even if CDCL returns UNSAT.
     cout << "s UNSATISFIABLE\n";
+    if (want_stats) {
+        cerr << "c stats: decisions=" << solver.decisions
+             << " conflicts=" << solver.conflicts
+             << " propagations=" << solver.propagations
+             << " learnt=" << solver.learnt_ids.size() << "\n";
+        if (solver.ct) cerr << "c stats: covertrace_U=" << solver.ct->U.size() << "\n";
+    }
     return 20;
 }
 
