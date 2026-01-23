@@ -67,13 +67,16 @@ static CNF parse_dimacs(const string& path) {
         }
         int lit = stoi(tok);
         if (lit == 0) {
-            if (!cur.empty()) cnf.clauses.push_back(cur);
+            if (!cur.empty()) {
+                cnf.clauses.push_back(cur);
+            }
             cur.clear();
         } else {
             cur.push_back(lit);
         }
     }
     if (!cur.empty()) cnf.clauses.push_back(cur);
+    sort(cnf.clauses.begin(), cnf.clauses.end(),  [] (auto &c1, auto &c2) { return c1.size() < c2.size(); });    
     return cnf;
 }
 
@@ -1402,13 +1405,13 @@ int main(int argc, char** argv) {
     cin.tie(nullptr);
 
     Mode mode = MODE_INTERLEAVED;
-    bool ct_seed_original = false;
-    int ct_every = 2000;
-    int ct_batch = 256;
-    int ct_lbd = 6;
-    int ct_maxlen = 12;
-    int ct_witness_phase_every = 5000;
-    size_t ct_maxu = 128;
+    bool ct_seed_original = true;
+    int ct_every = 64;
+    int ct_batch = 16;
+    int ct_lbd = 2;
+    int ct_maxlen = 4;
+    int ct_witness_phase_every = 32;
+    size_t ct_maxu = 8;
 
     string path;
     for (int i = 1; i < argc; ++i) {
@@ -1492,6 +1495,7 @@ int main(int argc, char** argv) {
     cout << "s UNSATISFIABLE\n";
     return 20;
 }
+
 
 
 
